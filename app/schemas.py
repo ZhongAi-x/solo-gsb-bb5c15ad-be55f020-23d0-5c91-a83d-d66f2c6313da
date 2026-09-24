@@ -421,3 +421,89 @@ class PagedOverdueInvoices(BaseModel):
     total: int
     pages: int
     as_of: str
+
+
+# ---- 分期回款计划 ----
+
+
+class InstallmentIn(BaseModel):
+    """创建分期回款计划时的单个期次。"""
+
+    due_date: str = Field(
+        description="本期到期日，ISO 8601 日期 YYYY-MM-DD（如 '2026-10-01'）；"
+        "只接受日期形状，不接受带时间成分"
+    )
+    amount: str = Field(
+        description="本期应收金额，发票币种的十进制字符串；必须大于 0 且为币种最小单位的正整数倍，"
+        "如 USD 下 '10.00'、JPY 下 '1000'"
+    )
+
+    @field_validator("due_date")
+    @classmethod
+    def _check_due_date(cls, v: str) -> str:
+        return parse_iso_date(v, "installments[].due_date").isoformat()
+
+    @field_validator("amount")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"amount 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class InstallmentPlanCreate(BaseModel):
+    """为单张发票创建分期回款计划的请求体。"""
+
+    installments: list[InstallmentIn] = Field(
+        min_length=1,
+        description="分期期次列表，至少 1 期；必须按到期日 **升序** 排列"
+        "（允许同日多期），各期金额为币种最小单位的正数，期次合计须等于发票含税总额",
+    )
+
+    @field_validator("installments")
+    @classmethod
+    def _check_ascending_due_dates(cls, v: list[InstallmentIn]) -> list[InstallmentIn]:
+        for idx in range(1, len(v)):
+            prev_due = v[idx - 1].due_date
+            cur_due = v[idx].due_date
+            if cur_due < prev_due:
+                raise ValueError(
+                    "installments 必须按到期日升序排列："
+                    f"第 {idx} 期 {prev_due} 晚于第 {idx + 1} 期 {cur_due}"
+                )
+        return v
+
+
+class InstallmentOut(BaseModel):
+    """单个期次的查询结果：计划金额 + 按净已收额 FIFO 抵扣后的覆盖情况。"""
+
+    model_config = ConfigDict(extra="allow")
+    installment: int
+    due_date: str
+    amount: str
+    covered: str
+    uncovered: str
+    overdue: str
+
+
+class InstallmentPlanResult(BaseModel):
+    """分期回款计划视图（创建与查询共用）。
+
+    净已收额（收款 − 冲销）按期次顺序逐期抵扣（FIFO）；只有到期日严格早于
+    ``as_of`` 的未覆盖额计入 ``overdue_total``。查询不改写原计划：冲销后
+    净已收回降，较后期次的 ``uncovered`` 会相应回升。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    plan_id: int
+    invoice_id: int
+    currency: str
+    created_at: str
+    as_of: str
+    total_gross: str
+    net_paid: str
+    covered_total: str
+    uncovered_total: str
+    overdue_total: str
+    installments: list[InstallmentOut]

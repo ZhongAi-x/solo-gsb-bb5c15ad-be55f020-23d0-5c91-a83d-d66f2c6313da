@@ -1,11 +1,14 @@
 """SQLite 持久化层。
 
-存储四张表：
+存储六张表：
 * ``invoices``          —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
 * ``invoice_lines``     —— 逐行结果（税额残差分配后的最终值，含换算列）；
 * ``payments``          —— 收款登记（每笔收款的金额、币种与登记时间）；
 * ``payment_reversals`` —— 收款冲销（每笔冲销的金额、币种与登记时间，
-  关联原收款流水；原收款不删除，余额一律按净入账额 = 收款 − 冲销 计算）。
+  关联原收款流水；原收款不删除，余额一律按净入账额 = 收款 − 冲销 计算）；
+* ``installment_plans``      —— 分期回款计划头（每张发票至多一份，invoice_id 唯一）；
+* ``installment_plan_items`` —— 计划期次（期次号、到期日、金额，按期次号升序），
+  期次金额合计等于发票含税总额；查询时不改写计划，覆盖/逾期状态实时按净已收额计算。
 """
 
 from __future__ import annotations
@@ -77,6 +80,25 @@ CREATE TABLE IF NOT EXISTS payment_reversals (
 );
 
 CREATE INDEX IF NOT EXISTS idx_payment_reversals_payment_id ON payment_reversals(payment_id);
+
+-- 每张发票至多一份分期回款计划：invoice_id 上的唯一约束是并发兜底
+CREATE TABLE IF NOT EXISTS installment_plans (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL UNIQUE REFERENCES invoices(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS installment_plan_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id     INTEGER NOT NULL REFERENCES installment_plans(id) ON DELETE CASCADE,
+    installment INTEGER NOT NULL,
+    due_date    TEXT NOT NULL,
+    amount      TEXT NOT NULL,
+    UNIQUE(plan_id, installment)
+);
+
+CREATE INDEX IF NOT EXISTS idx_installment_plan_items_plan_id
+    ON installment_plan_items(plan_id);
 """
 
 
@@ -94,6 +116,18 @@ class PaymentNotFoundError(Exception):
     def __init__(self, payment_id: int) -> None:
         self.payment_id = payment_id
         super().__init__(f"收款流水 {payment_id} 不存在")
+
+
+class PlanAlreadyExistsError(Exception):
+    """为已存在分期回款计划的发票再次创建计划。"""
+
+    def __init__(self, invoice_id: int, plan_id: int) -> None:
+        self.invoice_id = invoice_id
+        self.plan_id = plan_id
+        super().__init__(
+            f"发票 {invoice_id} 已存在分期回款计划（plan_id={plan_id}），"
+            f"每张发票只允许一份计划"
+        )
 
 
 def utc_now_iso() -> str:
@@ -815,4 +849,179 @@ def payment_snapshot(
         "reversal_count": len(reversal_rows),
         "payments": payments,
         "reversals": reversals,
+    }
+
+
+# ---- 分期回款计划 ----
+
+
+def get_installment_plan(
+    conn: sqlite3.Connection, invoice_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM installment_plans WHERE invoice_id = ?", (invoice_id,)
+    ).fetchone()
+
+
+def get_installment_plan_items(
+    conn: sqlite3.Connection, plan_id: int
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT * FROM installment_plan_items WHERE plan_id = ? ORDER BY installment",
+            (plan_id,),
+        ).fetchall()
+    )
+
+
+def create_installment_plan(
+    conn: sqlite3.Connection,
+    invoice_id: int,
+    installments: list[tuple[str, Decimal]],
+) -> dict[str, Any]:
+    """为单张发票创建唯一一份分期回款计划：全部校验与写入在 **同一事务** 完成。
+
+    ``installments`` 为 ``(due_date, amount)`` 列表，调用方（schema 层）已保证
+    非空且到期日非递减（升序、允许相同）。事务内（``BEGIN IMMEDIATE``）再做
+    全部业务校验，任一不满足都回滚、**不留下任何计划行**：
+
+    * 发票不存在 -> :class:`InvoiceNotFoundError`
+    * 该发票已存在计划 -> :class:`PlanAlreadyExistsError`
+    * 任一期金额 ≤ 0、不是发票币种最小单位的正整数倍 -> ``ValueError``
+    * 期次金额合计不等于发票含税总额 -> ``ValueError``
+
+    成功后返回按当前 UTC 日期计算的完整计划视图（与查询接口同构）。
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        inv = conn.execute(
+            "SELECT id, currency, currency_digits, total_gross FROM invoices WHERE id = ?",
+            (invoice_id,),
+        ).fetchone()
+        if inv is None:
+            raise InvoiceNotFoundError(invoice_id)
+
+        existing = conn.execute(
+            "SELECT id FROM installment_plans WHERE invoice_id = ?", (invoice_id,)
+        ).fetchone()
+        if existing is not None:
+            raise PlanAlreadyExistsError(invoice_id, int(existing["id"]))
+
+        unit = _minor_unit(int(inv["currency_digits"]))
+        gross = Decimal(inv["total_gross"])
+
+        amounts: list[Decimal] = []
+        for idx, (_due, raw_amount) in enumerate(installments, start=1):
+            if raw_amount <= 0:
+                raise ValueError(f"第 {idx} 期金额必须大于 0，收到 {raw_amount}")
+            if (raw_amount / unit) != (raw_amount / unit).to_integral_value():
+                raise ValueError(
+                    f"第 {idx} 期金额 {raw_amount} 不是 {inv['currency']} 最小单位 "
+                    f"{unit} 的整数倍"
+                )
+            amounts.append(raw_amount.quantize(unit))
+
+        total = sum(amounts, Decimal("0"))
+        if total != gross:
+            raise ValueError(
+                f"期次合计 {format(total, 'f')} 与发票含税总额 "
+                f"{format(gross, 'f')} 不一致，未创建任何计划"
+            )
+
+        created_at = utc_now_iso()
+        cur = conn.execute(
+            "INSERT INTO installment_plans (invoice_id, created_at) VALUES (?, ?)",
+            (invoice_id, created_at),
+        )
+        plan_id = int(cur.lastrowid)
+        conn.executemany(
+            """
+            INSERT INTO installment_plan_items (plan_id, installment, due_date, amount)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (plan_id, idx, due, format(amount, "f"))
+                for idx, ((due, _raw), amount) in enumerate(
+                    zip(installments, amounts), start=1
+                )
+            ],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return installment_plan_status(
+        conn, inv, plan_id, created_at,
+        get_installment_plan_items(conn, plan_id),
+        datetime.now(timezone.utc).date(),
+    )
+
+
+def installment_plan_status(
+    conn: sqlite3.Connection,
+    invoice: sqlite3.Row | dict[str, Any],
+    plan_id: int,
+    created_at: str,
+    item_rows: list[sqlite3.Row],
+    as_of: date,
+) -> dict[str, Any]:
+    """按期次顺序用净已收额（收款 − 冲销）逐期抵扣，生成计划视图。
+
+    抵扣为**先进先出（FIFO）**：净已收总额先覆盖第 1 期，剩余再覆盖第 2 期，
+    依次类推；每期得到 ``covered``（已覆盖额）与 ``uncovered``（未覆盖额 =
+    期次金额 − 已覆盖额）。**只有到期日严格早于 ``as_of`` 的未覆盖额计入
+    ``overdue``（逾期额）**，到期日当天不计逾期。
+
+    计算只读取 ``payments`` / ``payment_reversals``（沿用现有净已收口径），
+    **从不改写原计划**；收款被冲销后净已收回降，较后期次会重新打开（uncovered
+    回升），计划行本身保持创建时的期次与金额不变。
+    """
+
+    invoice_id = int(invoice["id"])
+    currency = invoice["currency"]
+    unit = _minor_unit(int(invoice["currency_digits"]))
+    gross = Decimal(invoice["total_gross"]).quantize(unit)
+    net_paid = _paid_total(conn, invoice_id).quantize(unit)
+
+    as_of_text = as_of.isoformat()
+    remaining_credit = net_paid
+    items: list[dict[str, Any]] = []
+    covered_total = Decimal("0")
+    uncovered_total = Decimal("0")
+    overdue_total = Decimal("0")
+    for r in item_rows:
+        amount = Decimal(r["amount"]).quantize(unit)
+        covered = remaining_credit if remaining_credit < amount else amount
+        if covered > 0:
+            remaining_credit -= covered
+        uncovered = amount - covered
+        overdue = uncovered if r["due_date"] < as_of_text else Decimal("0").quantize(unit)
+        covered_total += covered
+        uncovered_total += uncovered
+        overdue_total += overdue
+        items.append(
+            {
+                "installment": int(r["installment"]),
+                "due_date": r["due_date"],
+                "amount": format(amount, "f"),
+                "covered": format(covered, "f"),
+                "uncovered": format(uncovered, "f"),
+                "overdue": format(overdue, "f"),
+            }
+        )
+
+    return {
+        "plan_id": plan_id,
+        "invoice_id": invoice_id,
+        "currency": currency,
+        "created_at": created_at,
+        "as_of": as_of_text,
+        "total_gross": format(gross, "f"),
+        "net_paid": format(net_paid, "f"),
+        "covered_total": format(covered_total.quantize(unit), "f"),
+        "uncovered_total": format(uncovered_total.quantize(unit), "f"),
+        "overdue_total": format(overdue_total.quantize(unit), "f"),
+        "installments": items,
     }

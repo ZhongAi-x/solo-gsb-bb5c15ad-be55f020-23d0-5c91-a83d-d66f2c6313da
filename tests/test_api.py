@@ -1218,6 +1218,369 @@ class ApiTests(unittest.TestCase):
         # 快照时点不得早于发票创建
         self.assertEqual(s["invoice_created_at"], created)
 
+    def test_21_installment_plan_create_and_get(self) -> None:
+        # total_gross = 33.11 USD，3 期：10.00 / 13.11 / 10.00
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "10.05", "tax_rate": "0.10"},
+                    {"net": "20.05", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/installment-plan"
+        payload = {
+            "installments": [
+                {"due_date": "2026-08-01", "amount": "10.00"},
+                {"due_date": "2026-09-01", "amount": "13.11"},
+                {"due_date": "2026-10-15", "amount": "10.00"},
+            ]
+        }
+
+        status, plan = self._request("POST", path, payload)
+        self.assertEqual(status, 201, plan)
+        self.assertEqual(plan["invoice_id"], invoice_id)
+        self.assertIn("plan_id", plan)
+        self.assertIn("created_at", plan)
+        self.assertEqual(plan["as_of"], "2026-09-24")
+        self.assertEqual(plan["currency"], "USD")
+        self.assertEqual(plan["total_gross"], "33.11")
+        self.assertEqual(plan["net_paid"], "0.00")
+        self.assertEqual(plan["covered_total"], "0.00")
+        self.assertEqual(plan["uncovered_total"], "33.11")
+        # 创建时 as_of=2026-09-24：前两期已到期
+        self.assertEqual(plan["overdue_total"], "23.11")
+        self.assertEqual(
+            [(it["installment"], it["due_date"], it["amount"],
+              it["covered"], it["uncovered"], it["overdue"])
+             for it in plan["installments"]],
+            [
+                (1, "2026-08-01", "10.00", "0.00", "10.00", "10.00"),
+                (2, "2026-09-01", "13.11", "0.00", "13.11", "13.11"),
+                (3, "2026-10-15", "10.00", "0.00", "10.00", "0.00"),
+            ],
+        )
+
+        # GET 与 POST 返回同构视图
+        status, fetched = self._request("GET", f"{path}?as_of=2026-09-24")
+        self.assertEqual(status, 200, fetched)
+        self.assertEqual(fetched, plan)
+
+        # 到期日当天不算逾期：as_of=2026-08-01 时第 1 期 overdue=0
+        status, at_due = self._request("GET", f"{path}?as_of=2026-08-01")
+        self.assertEqual(status, 200)
+        self.assertEqual(at_due["overdue_total"], "0.00")
+        self.assertEqual(at_due["installments"][0]["overdue"], "0.00")
+
+        # 一天之后：第 1 期全额逾期
+        status, after_due = self._request("GET", f"{path}?as_of=2026-08-02")
+        self.assertEqual(status, 200)
+        self.assertEqual(after_due["overdue_total"], "10.00")
+
+        # 全部到期后：所有未覆盖额都逾期
+        status, late = self._request("GET", f"{path}?as_of=2030-01-01")
+        self.assertEqual(late["overdue_total"], "33.11")
+
+        # 期次合计 + 覆盖汇总恒等
+        from decimal import Decimal
+        for body in (at_due, after_due, late):
+            self.assertEqual(
+                sum(Decimal(it["amount"]) for it in body["installments"]),
+                Decimal("33.11"),
+            )
+            self.assertEqual(
+                Decimal(body["covered_total"]) + Decimal(body["uncovered_total"]),
+                Decimal(body["total_gross"]),
+            )
+
+        # 缺省 as_of：回显 UTC 当日
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date().isoformat()
+        status, default_view = self._request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(default_view["as_of"], today)
+
+    def test_22_installment_plan_fifo_coverage(self) -> None:
+        # 3 期 10.00 / 13.11 / 10.00 = 33.11；收款逐期 FIFO 抵扣
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "10.05", "tax_rate": "0.10"},
+                    {"net": "20.05", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/installment-plan"
+        status, _ = self._request(
+            "POST",
+            path,
+            {
+                "installments": [
+                    {"due_date": "2026-08-01", "amount": "10.00"},
+                    {"due_date": "2026-09-01", "amount": "13.11"},
+                    {"due_date": "2026-10-15", "amount": "10.00"},
+                ]
+            },
+        )
+        self.assertEqual(status, 201)
+
+        def view(as_of: str = "2026-09-24"):
+            status, body = self._request("GET", f"{path}?as_of={as_of}")
+            self.assertEqual(status, 200, body)
+            return body
+
+        # 收款 20.00：第 1 期覆盖满，第 2 期覆盖 10.00/未覆盖 3.11
+        status, _ = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "20.00"}
+        )
+        self.assertEqual(status, 201)
+        v = view()
+        self.assertEqual(v["net_paid"], "20.00")
+        self.assertEqual(v["covered_total"], "20.00")
+        self.assertEqual(v["uncovered_total"], "13.11")
+        # 仅第 2 期未覆盖的 3.11 逾期（第 1 期已覆盖，第 3 期未到期）
+        self.assertEqual(v["overdue_total"], "3.11")
+        self.assertEqual(
+            [(it["covered"], it["uncovered"], it["overdue"])
+             for it in v["installments"]],
+            [("10.00", "0.00", "0.00"),
+             ("10.00", "3.11", "3.11"),
+             ("0.00", "10.00", "0.00")],
+        )
+
+        # 再收 13.11 恰好收满：全部覆盖，逾期归零
+        status, _ = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "13.11"}
+        )
+        self.assertEqual(status, 201)
+        v = view("2030-01-01")
+        self.assertEqual(v["net_paid"], "33.11")
+        self.assertEqual(v["covered_total"], "33.11")
+        self.assertEqual(v["uncovered_total"], "0.00")
+        self.assertEqual(v["overdue_total"], "0.00")
+        self.assertTrue(all(it["covered"] == it["amount"] for it in v["installments"]))
+
+    def test_23_installment_plan_reversal_reopens(self) -> None:
+        # 收满后冲销：净已收回降，后期次重新打开；原计划期次/金额不变
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/installment-plan"
+        status, created = self._request(
+            "POST",
+            path,
+            {
+                "installments": [
+                    {"due_date": "2026-08-01", "amount": "40.00"},
+                    {"due_date": "2026-09-01", "amount": "60.00"},
+                ]
+            },
+        )
+        self.assertEqual(status, 201, created)
+
+        # 来款分配也走 payments 表，计划抵扣必须可见
+        status, alloc = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "100.00", "invoice_ids": [invoice_id]},
+        )
+        self.assertEqual(status, 201, alloc)
+        payment_id = alloc["allocations"][0]["payment_id"]
+
+        status, full = self._request("GET", f"{path}?as_of=2026-09-24")
+        self.assertEqual(status, 200)
+        self.assertEqual(full["covered_total"], "100.00")
+        self.assertEqual(full["uncovered_total"], "0.00")
+        self.assertEqual(full["overdue_total"], "0.00")
+
+        # 冲销 70.00：净已收 30.00 -> 第 1 期覆盖 30/未覆盖 10，第 2 期完全重新打开
+        status, rev = self._request(
+            "POST",
+            f"/api/v1/payments/{payment_id}/reversals",
+            {"amount": "70.00"},
+        )
+        self.assertEqual(status, 201, rev)
+        status, reopened = self._request("GET", f"{path}?as_of=2026-09-24")
+        self.assertEqual(status, 200, reopened)
+        self.assertEqual(reopened["net_paid"], "30.00")
+        self.assertEqual(reopened["covered_total"], "30.00")
+        self.assertEqual(reopened["uncovered_total"], "70.00")
+        self.assertEqual(reopened["overdue_total"], "70.00")
+        self.assertEqual(
+            [(it["installment"], it["amount"], it["covered"], it["uncovered"])
+             for it in reopened["installments"]],
+            [(1, "40.00", "30.00", "10.00"), (2, "60.00", "0.00", "60.00")],
+        )
+        # 原计划行未被改写：期次号、到期日、金额与创建时一致
+        self.assertEqual(
+            [(it["installment"], it["due_date"], it["amount"])
+             for it in reopened["installments"]],
+            [(it["installment"], it["due_date"], it["amount"])
+             for it in created["installments"]],
+        )
+
+    def test_24_installment_plan_validation(self) -> None:
+        # gross 10.00 USD
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "10.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/installment-plan"
+
+        def post(installments):
+            return self._request("POST", path, {"installments": installments})
+
+        # 期次合计不等于含税总额 -> 422
+        status, body = post([{"due_date": "2026-08-01", "amount": "9.00"}])
+        self.assertEqual(status, 422, body)
+        self.assertIn("含税总额", body["detail"])
+
+        # 合计相等但存在 0 / 负数金额 -> 422
+        for bad in ("0", "-1.00"):
+            status, _ = post(
+                [{"due_date": "2026-08-01", "amount": bad},
+                 {"due_date": "2026-09-01", "amount": "10.00"}]
+            )
+            self.assertEqual(status, 422, bad)
+
+        # 小于币种最小单位 -> 422
+        status, _ = post(
+            [{"due_date": "2026-08-01", "amount": "9.999"},
+             {"due_date": "2026-09-01", "amount": "0.001"}]
+        )
+        self.assertEqual(status, 422)
+
+        # 到期日未按升序排列 -> 422（pydantic 校验，detail 为错误列表）
+        status, body = post(
+            [{"due_date": "2026-09-01", "amount": "5.00"},
+             {"due_date": "2026-08-01", "amount": "5.00"}]
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("升序", json.dumps(body, ensure_ascii=False))
+
+        # 期次为空 -> 422
+        status, _ = post([])
+        self.assertEqual(status, 422)
+
+        # 到期日格式非法（带时间 / 不存在的日期）-> 422
+        for bad in ("2026-08", "2026-08-01T00:00:00Z", "2026/08/01", "not-a-date"):
+            status, _ = post([{"due_date": bad, "amount": "10.00"}])
+            self.assertEqual(status, 422, bad)
+
+        # 所有失败都不得创建计划
+        status, _ = self._request("GET", path)
+        self.assertEqual(status, 404)
+
+        # 成功创建一份
+        status, plan = post(
+            [{"due_date": "2026-08-01", "amount": "4.00"},
+             {"due_date": "2026-08-01", "amount": "6.00"}]  # 同日多期允许
+        )
+        self.assertEqual(status, 201, plan)
+
+        # 每张发票只允许一份：再次创建 -> 409
+        status, body = post([{"due_date": "2026-12-01", "amount": "10.00"}])
+        self.assertEqual(status, 409)
+        self.assertIn("只允许一份", body["detail"])
+
+        # 发票不存在：创建 404、查询 404
+        status, _ = self._request(
+            "POST",
+            "/api/v1/invoices/999999/installment-plan",
+            {"installments": [{"due_date": "2026-08-01", "amount": "1.00"}]},
+        )
+        self.assertEqual(status, 404)
+        status, body = self._request(
+            "GET", "/api/v1/invoices/999999/installment-plan"
+        )
+        self.assertEqual(status, 404)
+        self.assertIn("不存在", body["detail"])
+
+        # 查询时 as_of 非法 -> 422
+        status, _ = self._request("GET", f"{path}?as_of=2026-13-40")
+        self.assertEqual(status, 422)
+
+    def test_25_installment_plan_jpy_and_concurrent(self) -> None:
+        # 0 位小数币种：金额不带小数位，非整数最小单位（0.5）被拒绝
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "JPY", "lines": [{"net": "1000", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        jpy_id = inv["id"]
+        path = f"/api/v1/invoices/{jpy_id}/installment-plan"
+        status, body = self._request(
+            "POST",
+            path,
+            {
+                "installments": [
+                    {"due_date": "2026-08-01", "amount": "400"},
+                    {"due_date": "2026-09-01", "amount": "600"},
+                ]
+            },
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["total_gross"], "1000")
+        self.assertEqual(body["uncovered_total"], "1000")
+        self.assertEqual(body["installments"][0]["amount"], "400")
+
+        status, _ = self._request(
+            "POST", f"/api/v1/invoices/{jpy_id}/payments", {"amount": "500"}
+        )
+        self.assertEqual(status, 201)
+        status, v = self._request("GET", f"{path}?as_of=2026-09-24")
+        self.assertEqual(status, 200)
+        self.assertEqual(v["net_paid"], "500")
+        self.assertEqual(
+            [(it["covered"], it["uncovered"], it["overdue"])
+             for it in v["installments"]],
+            [("400", "0", "0"), ("100", "500", "500")],
+        )
+
+        # 并发为同一张发票创建计划：唯一约束 + BEGIN IMMEDIATE，只允许一份
+        status, inv2 = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "10.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv2)
+        target = inv2["id"]
+        target_path = f"/api/v1/invoices/{target}/installment-plan"
+        payload = {"installments": [{"due_date": "2026-08-01", "amount": "10.00"}]}
+
+        codes: list[int] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            code, _ = self._request("POST", target_path, payload)
+            with lock:
+                codes.append(code)
+
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(codes), [201] + [409] * 7)
+
 
 if __name__ == "__main__":
     unittest.main()
