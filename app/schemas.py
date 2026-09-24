@@ -421,3 +421,94 @@ class PagedOverdueInvoices(BaseModel):
     total: int
     pages: int
     as_of: str
+
+
+# ---- 分期回款计划 ----
+
+
+class PlanInstallmentIn(BaseModel):
+    due_date: str = Field(
+        description="该期到期日，ISO 8601 日期 YYYY-MM-DD；各期必须按到期日升序提交且不得重复"
+    )
+    amount: str = Field(
+        description="该期金额，发票币种的十进制字符串，必须大于 0 且为币种最小单位的整数倍，如 '11.04'"
+    )
+
+    @field_validator("due_date")
+    @classmethod
+    def _check_due_date(cls, v: str) -> str:
+        return parse_iso_date(v, "due_date").isoformat()
+
+    @field_validator("amount")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"amount 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class PaymentPlanCreate(BaseModel):
+    """单张发票的分期回款计划：每张发票只允许一份，创建后不再改写。"""
+
+    installments: list[PlanInstallmentIn] = Field(
+        min_length=1,
+        description="期次列表，至少 1 期；必须按到期日升序排列，"
+        "各期金额合计必须等于发票含税总额 total_gross",
+    )
+
+
+class PlanInstallmentOut(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    seq: int
+    due_date: str
+    amount: str
+
+
+class PaymentPlanResult(BaseModel):
+    """创建分期回款计划成功后的响应：计划定义（静态保存，不再改写）。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    currency: str
+    total_amount: str
+    installment_count: int
+    created_at: str
+    installments: list[PlanInstallmentOut]
+
+
+class PlanInstallmentStatus(BaseModel):
+    """查询时单期的覆盖情况：当前净已收额按期次顺序逐期抵扣后的结果。"""
+
+    model_config = ConfigDict(extra="allow")
+    seq: int
+    due_date: str
+    amount: str
+    covered: str
+    uncovered: str
+    overdue: str
+
+
+class PaymentPlanStatus(BaseModel):
+    """分期回款计划的当前覆盖情况。
+
+    把当前净已收额（收款 − 冲销）按期次顺序逐期抵扣：``covered`` 为该期已覆盖
+    额，``uncovered`` 为未覆盖额；仅到期日严格早于 ``as_of`` 的期次，其未覆盖
+    额计入 ``overdue`` 与顶层 ``overdue_total``。计划本身不改写，收款/冲销后
+    再次查询即用最新净已收重新抵扣。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    currency: str
+    as_of: str
+    total_amount: str
+    paid_total: str
+    covered_total: str
+    uncovered_total: str
+    overdue_total: str
+    installment_count: int
+    created_at: str
+    installments: list[PlanInstallmentStatus]

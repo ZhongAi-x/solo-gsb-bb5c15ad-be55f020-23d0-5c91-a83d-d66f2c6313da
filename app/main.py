@@ -28,6 +28,9 @@ from .schemas import (
     PaymentAllocationResult,
     PaymentCreate,
     PaymentOverview,
+    PaymentPlanCreate,
+    PaymentPlanResult,
+    PaymentPlanStatus,
     PaymentResult,
     PaymentSnapshot,
     ReversalCreate,
@@ -47,14 +50,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
         "收款冲销（分次冲销、按净入账额计算余额）、"
         "一笔来款在多张同币种待结发票间按到期日顺序分配、"
         "到期日（due_date）与逾期发票分页查询、"
-        "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间），SQLite 持久化。"
+        "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
+        "单张发票的分期回款计划（每张发票一份，净已收按期次逐期抵扣、"
+        "按查询日期统计逾期额），SQLite 持久化。"
     ),
     lifespan=lifespan,
 )
@@ -380,3 +385,71 @@ def create_reversal(
         return database.reverse_payment(conn, payment_id, amount)
     except database.PaymentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---- 分期回款计划 ----
+
+@app.post(
+    "/api/v1/invoices/{invoice_id}/payment-plan",
+    response_model=PaymentPlanResult,
+    status_code=201,
+    tags=["payment-plans"],
+)
+def create_payment_plan(
+    invoice_id: int,
+    payload: PaymentPlanCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """为单张发票创建分期回款计划（每张发票只允许一份）。
+
+    期次按到期日升序提交；每期金额须为发票币种最小单位的正数，各期合计须等于
+    发票含税总额。全部校验与写入在同一个 ``BEGIN IMMEDIATE`` 事务内完成，
+    任何失败都整体回滚、不留下部分计划。
+    """
+
+    installments = [
+        (inst.due_date, to_decimal(inst.amount, f"installments[{idx}].amount"))
+        for idx, inst in enumerate(payload.installments, start=1)
+    ]
+    try:
+        return database.create_payment_plan(conn, invoice_id, installments)
+    except database.InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except database.PlanAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/payment-plan",
+    response_model=PaymentPlanStatus,
+    tags=["payment-plans"],
+)
+def read_payment_plan(
+    invoice_id: int,
+    as_of: str | None = Query(
+        None,
+        description="查询日期 ISO 8601（YYYY-MM-DD）；缺省取 UTC 当前日期。"
+        "仅到期日严格早于该日的未覆盖额计为逾期额",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """查询分期回款计划的当前覆盖情况。
+
+    把当前净已收额（收款 − 冲销）按期次顺序逐期抵扣，返回每期已覆盖额与未
+    覆盖额；计划本身不改写，冲销后再次查询即反映重新打开的期次。
+    """
+
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    if as_of is None:
+        cutoff = datetime.now(timezone.utc).date()
+    else:
+        # 非法日期走全局 ValueError -> 422 处理器
+        cutoff = parse_iso_date(as_of, "as_of")
+    status = database.payment_plan_status(conn, row, cutoff)
+    if status is None:
+        raise HTTPException(
+            status_code=404, detail=f"发票 {invoice_id} 尚未创建分期回款计划"
+        )
+    return status

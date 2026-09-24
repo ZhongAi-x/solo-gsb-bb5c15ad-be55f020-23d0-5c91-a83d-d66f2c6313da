@@ -11,6 +11,7 @@
 - **来款分配**：传入币种、金额字符串与待结发票 ID 列表，把一笔来款按**到期日升序（未设置到期日排最后）、同日按 ID 升序**逐张抵扣；只处理列表内发票，不做跨币种换算。金额必须是币种最小单位的正整数倍；列表重复、发票不存在、币种不符或总未收不足时**整笔拒绝、不留下部分收款**。每张被抵扣的发票沿用同一条 `payments` 流水，单张收款查询与逾期查询均可见。
 - **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
 - **历史收款快照**：`GET /api/v1/invoices/{id}/payment-snapshot?at=...` 返回单张发票在指定 UTC 时点（必填、秒精度 `YYYY-MM-DDTHH:MM:SSZ`，截止秒为闭区间、同秒流水全部计入）的收款总额、冲销总额、净已收与未收余额；只统计该时点之前及当秒的流水，截止后的流水不改变历史结果，金额全程按发票币种最小单位用 `Decimal` 计算。
+- **分期回款计划**：`POST /api/v1/invoices/{id}/payment-plan` 为单张发票创建一份分期计划（期次按到期日升序、金额为币种最小单位正数、合计等于含税总额，每张发票仅一份，校验与写入同一事务）；`GET /api/v1/invoices/{id}/payment-plan?as_of=...` 把当前净已收额（收款 − 冲销）按期次逐期抵扣，返回每期已覆盖/未覆盖额，仅到期日早于查询日期的未覆盖额计为逾期额；计划静态保存不改写，冲销后再次查询即反映重新打开的期次。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
 - 内置 OpenAPI 交互文档（Swagger UI / ReDoc）。
 
@@ -85,6 +86,20 @@ curl -s 'http://localhost:8000/api/v1/invoices/overdue?page=1&page_size=20&as_of
 
 # 查询发票 1 在指定 UTC 时点的历史收款快照（at 必填，秒精度，截止秒含同秒流水）
 curl -s 'http://localhost:8000/api/v1/invoices/1/payment-snapshot?at=2026-10-15T12:00:00Z'
+
+# 为发票 1 创建分期回款计划（期次按到期日升序，合计须等于含税总额 33.11）
+curl -s -X POST http://localhost:8000/api/v1/invoices/1/payment-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "installments": [
+      {"due_date": "2026-10-01", "amount": "11.04"},
+      {"due_date": "2026-11-01", "amount": "11.04"},
+      {"due_date": "2026-12-01", "amount": "11.03"}
+    ]
+  }'
+
+# 查询计划覆盖情况（as_of 缺省取 UTC 当前日期；净已收按期次逐期抵扣）
+curl -s 'http://localhost:8000/api/v1/invoices/1/payment-plan?as_of=2026-11-15'
 ```
 
 > 以上命令要求服务已启动：在仓库根目录执行 `docker compose up -d --build`（见下一节）。
@@ -180,6 +195,8 @@ Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
 | `GET` | `/api/v1/invoices/{id}/payment-snapshot?at=...` | 单张发票在指定 UTC 时点（必填、秒精度）的历史收款快照：收款/冲销总额、净已收与未收余额 |
 | `POST` | `/api/v1/payments/{payment_id}/reversals` | 冲销一笔收款（可分次，累计不超过原收款），`201` |
 | `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201` |
+| `POST` | `/api/v1/invoices/{id}/payment-plan` | 创建分期回款计划（每张发票一份，期次升序、合计等于含税总额），`201` |
+| `GET` | `/api/v1/invoices/{id}/payment-plan?as_of=...` | 查询计划覆盖情况：净已收逐期抵扣，每期已覆盖/未覆盖/逾期额 |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
 
 ### 3.1 创建发票 `POST /api/v1/invoices`
@@ -535,12 +552,117 @@ curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
   因此 `GET /api/v1/invoices/{id}/payments` 与逾期分页查询都能看到分配结果，
   与单张收款登记完全一致。
 
-### 3.8 错误码
+### 3.8 分期回款计划
+
+为单张发票制定分期回款计划，并随时查询各期被实际回款覆盖的情况。
+
+**创建计划** `POST /api/v1/invoices/{id}/payment-plan`：
+
+请求体（金额用字符串）：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `installments` | array | 是 | 期次列表，**至少 1 期**，必须按到期日**升序**提交（不得相同） |
+| `installments[].due_date` | string | 是 | 该期到期日，ISO 8601 **日期** `YYYY-MM-DD`（非法日期返回 `422`） |
+| `installments[].amount` | string | 是 | 该期金额，**发票币种**十进制字符串；必须 **大于 0** 且为币种最小单位的整数倍 |
+
+规则：
+
+- **每张发票只允许一份计划**：重复创建返回 `409`，原计划保持不变；
+  `payment_plans.invoice_id` 唯一约束兜底，并发创建同一发票的计划只有一个成功。
+- 各期金额合计必须**恰好等于**发票含税总额 `total_gross`，不等返回 `422`。
+- 全部校验与写入在**同一个 `BEGIN IMMEDIATE` 写事务**内完成：任何一期不合法
+  都整体回滚，**不留下部分计划**。
+- 计划创建后**静态保存、不再改写**；发票上是否已有收款不影响创建。
+
+```bash
+# 发票 1 含税总额 33.11，分三期回款
+curl -s -X POST http://localhost:8000/api/v1/invoices/1/payment-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "installments": [
+      {"due_date": "2026-10-01", "amount": "11.04"},
+      {"due_date": "2026-11-01", "amount": "11.04"},
+      {"due_date": "2026-12-01", "amount": "11.03"}
+    ]
+  }'
+```
+
+响应 `201`（计划定义，`seq` 为期次序号，从 1 开始）：
+
+```json
+{
+  "id": 1,
+  "invoice_id": 1,
+  "currency": "USD",
+  "total_amount": "33.11",
+  "installment_count": 3,
+  "created_at": "2026-09-24T01:40:00Z",
+  "installments": [
+    {"seq": 1, "due_date": "2026-10-01", "amount": "11.04"},
+    {"seq": 2, "due_date": "2026-11-01", "amount": "11.04"},
+    {"seq": 3, "due_date": "2026-12-01", "amount": "11.03"}
+  ]
+}
+```
+
+**查询覆盖情况** `GET /api/v1/invoices/{id}/payment-plan?as_of=...`：
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `as_of` | string | 否 | UTC 当前日期 | 查询日期，ISO 8601 **日期** `YYYY-MM-DD`；格式不符返回 `422` |
+
+统计口径：
+
+1. 取该发票当前**净已收额**（收款 − 冲销，沿用现有收款/冲销流水，与未收余额
+   口径一致），按期次顺序**逐期抵扣**：每期 `covered = min(剩余净已收, 该期金额)`，
+   `uncovered = 该期金额 − covered`。
+2. **逾期额**：仅到期日**严格早于** `as_of` 的期次，其未覆盖额计入该期
+   `overdue` 与顶层 `overdue_total`；到期日当天及之后才到期的不算逾期。
+3. 计划本身不改写：收款/冲销后再次查询即用最新净已收重新抵扣，**冲销释放的
+   净额会自动重新打开靠后的期次**。
+4. 发票不存在返回 `404`；尚未创建计划的发票查询返回 `404`。
+
+```bash
+# 指定查询日期；缺省 as_of 时取 UTC 当前日期
+curl -s 'http://localhost:8000/api/v1/invoices/1/payment-plan?as_of=2026-11-15'
+```
+
+```json
+{
+  "id": 1,
+  "invoice_id": 1,
+  "currency": "USD",
+  "as_of": "2026-11-15",
+  "total_amount": "33.11",
+  "paid_total": "15.00",
+  "covered_total": "15.00",
+  "uncovered_total": "18.11",
+  "overdue_total": "7.08",
+  "installment_count": 3,
+  "created_at": "2026-09-24T01:40:00Z",
+  "installments": [
+    {"seq": 1, "due_date": "2026-10-01", "amount": "11.04",
+     "covered": "11.04", "uncovered": "0.00", "overdue": "0.00"},
+    {"seq": 2, "due_date": "2026-11-01", "amount": "11.04",
+     "covered": "3.96", "uncovered": "7.08", "overdue": "7.08"},
+    {"seq": 3, "due_date": "2026-12-01", "amount": "11.03",
+     "covered": "0.00", "uncovered": "11.03", "overdue": "0.00"}
+  ]
+}
+```
+
+上例净已收 15.00（收款 20.00 − 冲销 5.00）：第 1 期被全额覆盖，第 2 期覆盖
+3.96、未覆盖 7.08 且已过期（计入逾期），第 3 期未到期不计逾期。若再冲销，
+`paid_total` 下降，靠后期次的 `uncovered` 相应回升，计划的 `amount` 不变。
+
+### 3.9 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| `404` | 发票 id 不存在（含单张收款登记/查询、历史快照、来款分配时列表中任一 id 不存在）；冲销时收款流水 `payment_id` 不存在 |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、历史快照的 `at` 缺失或不是合法 UTC 秒精度时间（`YYYY-MM-DDTHH:MM:SSZ`）或早于发票创建时间、分页参数越界等（响应体 `detail` 为中文说明） |
+| `404` | 发票 id 不存在（含单张收款登记/查询、历史快照、来款分配时列表中任一 id 不存在、分期计划创建/查询）；冲销时收款流水 `payment_id` 不存在；查询尚未创建分期计划的发票 |
+| `409` | 该发票已存在分期回款计划（每张发票只允许一份），原计划保持不变 |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、分期计划期次为空、期次到期日未按升序或重复、期次金额 ≤ 0 或非最小单位整数倍、期次合计不等于含税总额、`due_date` / `as_of` 不是合法 ISO 日期、历史快照的 `at` 缺失或不是合法 UTC 秒精度时间（`YYYY-MM-DDTHH:MM:SSZ`）或早于发票创建时间、分页参数越界等（响应体 `detail` 为中文说明） |
 
 ---
 
@@ -584,7 +706,8 @@ python -m unittest tests.test_calc -v
 # 超额 422 不留记录、并发不超收、due_date 持久化、逾期分页/422、
 # 来款分配排序/整笔拒绝/分配与单张收款混合并发不超收、
 # 收款冲销分次/超额 422 不留记录/并发冲销不超额/冲销后余额回升再分配、
-# 历史收款快照（截止秒闭区间/同秒流水/截止后流水不改变历史/格式与早于发票创建 422/404）、持久化）
+# 历史收款快照（截止秒闭区间/同秒流水/截止后流水不改变历史/格式与早于发票创建 422/404）、
+# 分期回款计划（创建/唯一 409/校验 422 不留记录/逐期抵扣/逾期口径/冲销后重开期次/并发创建唯一）、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -595,14 +718,14 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 历史收款快照 / 收款冲销 / 来款分配
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 历史收款快照 / 收款冲销 / 来款分配 / 分期回款计划
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配 / 历史快照模型）
-│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配）/ 查询（含逾期与历史快照，WAL）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配 / 历史快照 / 分期计划模型）
+│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配 + 分期计划）/ 查询（含逾期、历史快照与计划覆盖，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、到期日与逾期查询、历史收款快照）
+│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、到期日与逾期查询、历史收款快照、分期回款计划）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -611,12 +734,16 @@ python -m unittest tests.test_api -v
 
 存储模型：`invoices`（发票头 + 汇总金额 + 可选到期日 `due_date` + 原始请求 JSON，
 供复算）、`invoice_lines`（逐行最终税额/含税及换算列）、`payments`（收款登记：
-金额、币种、登记时间）与 `payment_reversals`（收款冲销：金额、币种、登记时间，
-外键关联 `payments.id`）四张表，均通过外键级联删除。冲销不改动原收款流水，
-余额一律按净入账额（收款 − 冲销）实时计算。来款分配不引入新表：每张被
-抵扣的发票向 `payments` 写入一条同构流水（整笔失败则全部不写），因此单张收款
-查询与逾期查询天然可见分配结果，分配产生的流水同样可以被冲销。升级到含
-`due_date` / `payment_reversals` 的版本时，服务启动会自动对旧库执行
-`ALTER TABLE ... ADD COLUMN due_date` 与 `CREATE TABLE IF NOT EXISTS`，
+金额、币种、登记时间）、`payment_reversals`（收款冲销：金额、币种、登记时间，
+外键关联 `payments.id`）、`payment_plans`（分期回款计划头：发票、币种、合计
+金额、创建时间，`invoice_id` 唯一约束保证每张发票至多一份计划）与
+`payment_plan_installments`（计划期次：序号、到期日、金额）六张表，均通过
+外键级联删除。冲销不改动原收款流水，余额一律按净入账额（收款 − 冲销）实时计算。
+来款分配不引入新表：每张被抵扣的发票向 `payments` 写入一条同构流水（整笔失败
+则全部不写），因此单张收款查询与逾期查询天然可见分配结果，分配产生的流水同样
+可以被冲销。分期计划同样不改写：查询覆盖情况时用当前净已收额实时逐期抵扣，
+冲销后再次查询即反映重新打开的期次。升级到含
+`due_date` / `payment_reversals` / `payment_plans` 的版本时，服务启动会自动对
+旧库执行 `ALTER TABLE ... ADD COLUMN due_date` 与 `CREATE TABLE IF NOT EXISTS`，
 历史发票的到期日为空、不会出现在逾期结果中，历史收款无冲销记录、净入账额
-等于原收款金额。
+等于原收款金额，历史发票无分期计划、查询计划返回 `404`。
